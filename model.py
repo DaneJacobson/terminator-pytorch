@@ -36,28 +36,6 @@ def normalize(out):
 # -- Custom Modules -- #
 # -------------------- #
 
-def Linear1d(
-    in_channels: int,
-    out_channels: int,
-    stride: int = 1,
-    bias: bool = True,
-) -> torch.nn.Module:
-    """
-    Implements a Linear Layer in terms of a point-wise convolution in 1d.
-    """
-    return nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=bias)
-
-def Linear2d(
-    in_channels: int,
-    out_channels: int,
-    stride: int = 1,
-    bias: bool = True,
-) -> torch.nn.Module:
-    """
-    Implements a Linear Layer in terms of a point-wise convolution in 2d.
-    """
-    return nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=bias)
-
 class MAGNetLayer(torch.nn.Module):
     """
     Gabor-like filter as used in GaborNet for hyper kernel. Used to generate
@@ -81,7 +59,7 @@ class MAGNetLayer(torch.nn.Module):
                 (hidden_channels, data_dim)
             )
         
-        self.linear = Linear2d(data_dim, hidden_channels, bias=True)
+        self.linear = nn.Linear(data_dim, hidden_channels, bias=True)
         self.linear.weight.data *= (
             2 * np.pi * omega_0 * self.gamma.view(*self.gamma.shape, *((1,) * data_dim))
         )
@@ -119,7 +97,7 @@ class GlobalHyperZZW(nn.Module):
         # Hidden layers
         self.linears = nn.ModuleList(
             [
-                Linear2d(
+                nn.Linear(
                     in_channels=hidden_channels,
                     out_channels=hidden_channels,
                     bias=True,
@@ -129,7 +107,7 @@ class GlobalHyperZZW(nn.Module):
         )
         
         # Final layer
-        self.output_linear = Linear2d(
+        self.output_linear = nn.Linear(
             in_channels=hidden_channels,
             out_channels=out_channels,
             bias=True,
@@ -199,7 +177,7 @@ class GlobalChannelHyperZZW(torch.nn.Module):
         # Hidden layers
         self.linears = torch.nn.ModuleList(
             [
-                Linear2d(
+                nn.Linear(
                     in_channels=hidden_channels,
                     out_channels=hidden_channels,
                     bias=True,
@@ -209,7 +187,7 @@ class GlobalChannelHyperZZW(torch.nn.Module):
         )
         
         # Final layer
-        self.output_linear = Linear2d(
+        self.output_linear = nn.Linear(
             in_channels=hidden_channels,
             out_channels=out_channels,
             bias=True,
@@ -280,7 +258,7 @@ class LocalHyperZZW(nn.Module):
         # Hidden layers
         self.linears = torch.nn.ModuleList(
             [
-                Linear2d(
+                nn.Linear(
                     in_channels=hidden_channels,
                     out_channels=hidden_channels,
                     bias=True,
@@ -290,7 +268,7 @@ class LocalHyperZZW(nn.Module):
         )
         
         # Final layer
-        self.output_linear = Linear2d(
+        self.output_linear = nn.Linear(
             in_channels=hidden_channels,
             out_channels=out_channels,
             bias=True,
@@ -336,7 +314,7 @@ class LocalHyperZZW(nn.Module):
         self.fast_gelu1 = NonlinearType()
         self.fast_linears_x = torch.nn.ModuleList(
             [
-                Linear2d(
+                nn.Linear(
                     in_channels=hidden_channels,
                     out_channels=hidden_channels,
                     bias=True,
@@ -383,6 +361,45 @@ class LocalHyperZZW(nn.Module):
         out = self.output_linear(out)
         
         return out
+
+class RGUChannelMixer(nn.Module):
+    """
+    RGUChannelMixer, which is recursion applied to a gated linear unit (GLU).
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        bias_size: int,
+    ):
+        super().__init__()
+        self.hidden_channels = in_channels
+        self.bias_size = bias_size
+
+        # Declare modules
+        self.WK = nn.Linear(in_channels, in_channels)
+        self.WV = nn.Linear(in_channels, in_channels)
+        self.WQ = nn.Linear(in_channels, in_channels)
+        self.WY = nn.Linear(in_channels, in_channels)
+        self.GeLU = nn.functional.gelu
+        self.IS = nn.InstanceNorm2d(num_features=in_channels, momentum=1.0,) # TODO: This feels wrong I think it should be the default 0.1
+        self.bias_p = torch.nn.Parameter(torch.zeros(1, 1, bias_size, bias_size), requires_grad=True) # TODO: Simplify
+
+        # Initialize parameters
+        nn.init.kaiming_uniform_(self.WK.weight, nonlinearity="linear")
+        nn.init.kaiming_uniform_(self.WV.weight, nonlinearity="linear")
+        nn.init.kaiming_uniform_(self.WQ.weight, nonlinearity="linear")
+        nn.init.kaiming_uniform_(self.WY.weight, nonlinearity="linear")
+        nn.init.constant_(self.WK.bias, 0.0)
+        nn.init.constant_(self.WV.bias, 0.0)
+        nn.init.constant_(self.WQ.bias, 0.0)
+        nn.init.constant_(self.WY.bias, 0.0)
+
+    def forward(self, x):
+        K = self.WK(x)
+        V = self.WV(K)
+        Q = self.GeLU(self.IS(K*self.WQ(V))) + self.bias_p.repeat(x.shape[0], self.hidden_channels, 1, 1)
+        Y = self.WY(Q)
+        return Y
 
 class ChannelMixer(nn.Module):
     def __init__(self):
@@ -451,10 +468,10 @@ class SFNE(nn.Module):
         # Generate context-dependent global hyperkernel
         global_hyperkernel = self.global_hyperzzw(inp)
 
-        # RGUChannelMixer
+        # RGUChannelMixers
         slow_rgu_mlp_out = self.slow_rgu_mlp(global_hyperkernel)
         fast_rgu_mlp_out = self.fast_rgu_mlp(inp)
-        fast_out = self.istan(slow_rgu_mlp_out + fast_rgu_mlp_out)
+        fast_out = istan(slow_rgu_mlp_out + fast_rgu_mlp_out)
 
         # HyperChannelInteraction
         hci_out = istan(self.hyper_channel_interaction(inp))
